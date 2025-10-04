@@ -1,0 +1,344 @@
+// Arduino Nano - Bewegungsmelder + 4 Relais + WS2812B "Augen" (Paare)
+// Pins:
+// Relays: D2..D5
+// PIR: D10
+// WS2812B: D12 (50 LEDs)
+// Built-in LED: D13
+
+#include <Adafruit_NeoPixel.h>
+
+// ------------- Konfiguration -------------
+const uint8_t RELAY_PINS[] = {2, 3, 4, 5};
+const uint8_t NUM_RELAYS = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
+
+const uint8_t PIR_PIN = 10;
+const uint8_t LED_PIN = 12; // WS2812B data pin
+const uint16_t NUM_LEDS = 50;
+
+// Programmdauer einstellbar (ms)
+unsigned long PROGRAM_DURATION_MS = 20000UL; // z.B. 20 Sekunden, anpassbar
+
+// Wie lange jede Augen-Variante gezeigt wird (ms) bevor zufällig gewechselt
+unsigned long VARIANT_DURATION_MS = 4000UL; // z.B. 4 Sekunden
+
+// Relais-Pulsdauer (wie lange ein Relay an bleibt), einstellbar
+const unsigned long RELAY_PULSE_MS = 500UL; // 500 ms ON per pulse
+
+// Für jedes Relay definierbares Intervall (wie oft das Relay für RELAY_PULSE_MS anklingt)
+unsigned long RELAY_INTERVALS[] = {3000UL, 5000UL, 4000UL, 5000UL};
+
+// Anfangsverzögerung für jedes Relay (ms) -- Beispielwerte: Relay1 nach 5s, Relay2 sofort, Relay3 nach 2s, Relay4 nach 10s
+unsigned long RELAY_INITIAL_DELAYS[] = {5000UL, 0UL, 2000UL, 10000UL};
+
+// Compile-time checks: Arrays müssen zur Anzahl der Relais passen
+static_assert(sizeof(RELAY_INTERVALS) / sizeof(RELAY_INTERVALS[0]) == NUM_RELAYS,
+              "RELAY_INTERVALS muss genauso viele Einträge haben wie RELAY_PINS");
+static_assert(sizeof(RELAY_INITIAL_DELAYS) / sizeof(RELAY_INITIAL_DELAYS[0]) == NUM_RELAYS,
+              "RELAY_INITIAL_DELAYS muss genauso viele Einträge haben wie RELAY_PINS");
+
+// Wenn dein Relay-Modul aktiv LOW ist, setze RELAY_ON = LOW, RELAY_OFF = HIGH
+const uint8_t RELAY_ON = LOW;
+const uint8_t RELAY_OFF = HIGH;
+// -----------------------------------------
+
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Farbpalette (RGB) - kann erweitert/angepasst werden
+const uint8_t PALETTE[][3] = {
+  {255, 0, 0},   // rot
+  {0, 255, 0},   // grün
+  {0, 0, 255},   // blau
+  {255, 255, 0}, // gelb
+  {255, 0, 255}, // magenta
+  {0, 255, 255}, // cyan
+  {255, 255, 255} // weiß
+};
+const uint8_t PALETTE_SIZE = sizeof(PALETTE) / sizeof(PALETTE[0]);
+
+// Zustand Variablen
+bool programRunning = false;
+unsigned long programStart = 0;
+
+// Relais-Timer (parallel)
+// nextRelayTriggerTime: absolute millis() Zeit des nächsten Triggers
+unsigned long nextRelayTriggerTime[sizeof(RELAY_PINS)] = {0};
+bool relayIsOn[sizeof(RELAY_PINS)] = {false};
+unsigned long relayOnSince[sizeof(RELAY_PINS)] = {0};
+
+// Varianten-Handling für LEDs
+enum EyeVariant { VAR_STATIC = 0, VAR_BLINK, VAR_CHASE, VAR_PULSE };
+const uint8_t NUM_VARIANTS = 4;
+
+EyeVariant currentVariant = VAR_STATIC;
+unsigned long variantStartTime = 0;
+
+// Pulse (atmend) variables
+int pulseDir = 1;
+int pulseBrightness = 100; // 0..255 base
+
+// Blink specifics
+unsigned long blinkPeriodMs = 600; // default für Paar-Blink (kann je Variant zufällig geändert werden)
+
+// Chase specifics
+int chasePosition = 0;
+unsigned long lastChaseStep = 0;
+unsigned long chaseStepMs = 150; // Geschwindigkeit
+
+// Hilfsfunktion
+unsigned long now() { return millis(); }
+
+void setup() {
+  // Relais initialisieren
+  for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
+    relayIsOn[i] = false;
+    relayOnSince[i] = 0;
+    nextRelayTriggerTime[i] = 0;
+  }
+
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  strip.begin();
+  strip.setBrightness(150);
+  strip.show();
+
+  // Random seed (falls A0 frei ist)
+  randomSeed(analogRead(A0));
+
+  Serial.begin(115200);
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  unsigned long t = now();
+
+  if (!programRunning) {
+    if (digitalRead(PIR_PIN) == HIGH) {
+      startProgram();
+      delay(50); // kurzes Debounce
+    }
+  } else {
+    unsigned long elapsed = t - programStart;
+
+    // 1) Relais-Timer: unabhängig voneinander prüfen
+    for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+      handleRelayLoop(i, t);
+    }
+
+    // 2) Varianten-Wahl / LED-Steuerung
+    if (t - variantStartTime >= VARIANT_DURATION_MS) {
+      chooseNewVariant(t); // wählt zufällig eine Variante und startet sie
+    }
+    // Update aktiver Variante (Non-blocking)
+    updateVariant(t);
+
+    // 3) Programmende prüfen
+    if (elapsed >= PROGRAM_DURATION_MS) {
+      stopProgram();
+    }
+  }
+}
+
+// Startet das Programm
+void startProgram() {
+  programRunning = true;
+  programStart = now();
+  digitalWrite(LED_BUILTIN, HIGH);
+  Serial.println("Programm gestartet");
+
+  // Relays initial: setze nextTrigger auf programStart + initialDelay
+  for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
+    relayIsOn[i] = false;
+    relayOnSince[i] = 0;
+    // nächster Triggerzeitpunkt = Startzeit + Anfangsverzögerung
+    nextRelayTriggerTime[i] = programStart + RELAY_INITIAL_DELAYS[i];
+    Serial.print("Relay ");
+    Serial.print(i + 1);
+    Serial.print(" next trigger after ");
+    Serial.print(RELAY_INITIAL_DELAYS[i]);
+    Serial.println(" ms");
+  }
+
+  // LEDs initial - setzt sie aus, dann wählt sofort eine Variante
+  strip.clear();
+  strip.show();
+  chooseNewVariant(now());
+}
+
+// Stoppt das Programm
+void stopProgram() {
+  programRunning = false;
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // Relays aus
+  for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
+    relayIsOn[i] = false;
+  }
+
+  // LEDs aus
+  strip.clear();
+  strip.show();
+
+  Serial.println("Programm gestoppt - warte auf neue Bewegung");
+}
+
+// Verwaltung eines Relais: prüft, ob Intervall abgelaufen und schaltet für RELAY_PULSE_MS
+void handleRelayLoop(uint8_t idx, unsigned long t) {
+  unsigned long interval = RELAY_INTERVALS[idx];
+
+  // Falls nextRelayTriggerTime noch 0 (als Fallback), setze auf jetzt + initialDelay
+  if (nextRelayTriggerTime[idx] == 0) nextRelayTriggerTime[idx] = t + RELAY_INITIAL_DELAYS[idx];
+
+  if (!relayIsOn[idx]) {
+    // prüfen, ob es Zeit ist für den nächsten Trigger
+    // (unsigned wrap-around-sicherer Vergleich)
+    if ((long)(t - nextRelayTriggerTime[idx]) >= 0) {
+      // trigger on
+      digitalWrite(RELAY_PINS[idx], RELAY_ON);
+      relayIsOn[idx] = true;
+      relayOnSince[idx] = t;
+      // nächster Trigger = aktueller next + interval
+      nextRelayTriggerTime[idx] = nextRelayTriggerTime[idx] + interval;
+      Serial.print("Relay ");
+      Serial.print(idx + 1);
+      Serial.println(" ON (pulse)");
+    }
+  } else {
+    // Relay ist an: prüfen ob Pulsdauer abgelaufen
+    if (t - relayOnSince[idx] >= RELAY_PULSE_MS) {
+      digitalWrite(RELAY_PINS[idx], RELAY_OFF);
+      relayIsOn[idx] = false;
+      relayOnSince[idx] = 0;
+      Serial.print("Relay ");
+      Serial.print(idx + 1);
+      Serial.println(" OFF (pulse end)");
+    }
+  }
+}
+
+// Wählt eine neue Variante zufällig und initialisiert variant-spezifische Parameter
+void chooseNewVariant(unsigned long t) {
+  uint8_t v = random(NUM_VARIANTS); // 0..NUM_VARIANTS-1
+  currentVariant = (EyeVariant)v;
+  variantStartTime = t;
+
+  if (currentVariant == VAR_STATIC) {
+    setStaticPairs(random(PALETTE_SIZE));
+    Serial.println("Variante: STATIC (Paare statisch)");
+  } else if (currentVariant == VAR_BLINK) {
+    blinkPeriodMs = 300 + random(900);
+    setAllPairsOff();
+    Serial.print("Variante: BLINK (Periode ms = ");
+    Serial.print(blinkPeriodMs);
+    Serial.println(")");
+  } else if (currentVariant == VAR_CHASE) {
+    chasePosition = 0;
+    lastChaseStep = t;
+    chaseStepMs = 80 + random(200);
+    Serial.print("Variante: CHASE (step ms = ");
+    Serial.print(chaseStepMs);
+    Serial.println(")");
+  } else if (currentVariant == VAR_PULSE) {
+    pulseBrightness = 30 + random(180);
+    pulseDir = 1;
+    // Ensure we have base colors for pulsing
+    setStaticPairs(0);
+    Serial.println("Variante: PULSE (alle pulsieren)");
+  }
+}
+
+// Update der aktiven Variante (muss oft aufgerufen werden)
+void updateVariant(unsigned long t) {
+  switch (currentVariant) {
+    case VAR_STATIC:
+      break;
+
+    case VAR_BLINK: {
+      static unsigned long lastBlinkToggle = 0;
+      if (t - lastBlinkToggle >= blinkPeriodMs) {
+        lastBlinkToggle = t;
+        togglePairs();
+      }
+      break;
+    }
+
+    case VAR_CHASE: {
+      if (t - lastChaseStep >= chaseStepMs) {
+        lastChaseStep = t;
+        chaseStep();
+      }
+      break;
+    }
+
+    case VAR_PULSE: {
+      static unsigned long lastPulseUpdate = 0;
+      if (t - lastPulseUpdate >= 20) {
+        lastPulseUpdate = t;
+        pulseBrightness += pulseDir * 4;
+        if (pulseBrightness >= 240) { pulseBrightness = 240; pulseDir = -1; }
+        if (pulseBrightness <= 10)  { pulseBrightness = 10;  pulseDir = 1;  }
+        strip.setBrightness(constrain(pulseBrightness, 0, 255));
+        strip.show();
+      }
+      break;
+    }
+  }
+}
+
+// --- LED helper functions ---
+
+void setStaticPairs(uint8_t offset) {
+  for (uint16_t i = 0; i < NUM_LEDS; ++i) {
+    uint16_t pairIndex = i / 2;
+    uint8_t colorIdx = (pairIndex + offset) % PALETTE_SIZE;
+    uint8_t r = PALETTE[colorIdx][0];
+    uint8_t g = PALETTE[colorIdx][1];
+    uint8_t b = PALETTE[colorIdx][2];
+    strip.setPixelColor(i, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
+void setAllPairsOff() {
+  strip.clear();
+  strip.show();
+}
+
+void togglePairs() {
+  static bool on = false;
+  on = !on;
+  if (!on) {
+    setAllPairsOff();
+  } else {
+    for (uint16_t p = 0; p < NUM_LEDS / 2; ++p) {
+      uint8_t colorIdx = random(PALETTE_SIZE);
+      uint8_t r = PALETTE[colorIdx][0];
+      uint8_t g = PALETTE[colorIdx][1];
+      uint8_t b = PALETTE[colorIdx][2];
+      uint16_t i = p * 2;
+      strip.setPixelColor(i, strip.Color(r, g, b));
+      strip.setPixelColor(i + 1, strip.Color(r, g, b));
+    }
+    strip.show();
+  }
+}
+
+void chaseStep() {
+  strip.clear();
+  int pairCount = NUM_LEDS / 2;
+  int p = chasePosition % pairCount;
+  uint8_t colorIdx = p % PALETTE_SIZE;
+  uint8_t r = PALETTE[colorIdx][0];
+  uint8_t g = PALETTE[colorIdx][1];
+  uint8_t b = PALETTE[colorIdx][2];
+  int i = p * 2;
+  strip.setPixelColor(i, strip.Color(r, g, b));
+  if (i + 1 < NUM_LEDS) strip.setPixelColor(i + 1, strip.Color(r, g, b));
+  strip.show();
+  chasePosition = (chasePosition + 1) % pairCount;
+}
