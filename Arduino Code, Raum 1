@@ -1,0 +1,199 @@
+// ==================== EINSTELLUNGEN ====================
+
+// Puppen-Pins (2-6)
+const int puppetPins[] = {2,3,4,5,6};
+const int puppetCount = sizeof(puppetPins)/sizeof(puppetPins[0]);
+
+// Klopfer-Pins (7-9)
+const int klopferPins[] = {7,8,9};
+const int klopferCount = sizeof(klopferPins)/sizeof(klopferPins[0]);
+
+// Feuerflacker-Pins (MOSFETs)
+const int redPin = 10;
+const int greenPin = 11;
+
+// ------------------ Variablen ------------------
+
+// Event-Intervall in ms
+unsigned long eventInterval = 3000;
+
+// Startphase: Zeit in ms, in der alle Pins einmal aktiviert werden
+unsigned long startPhaseDuration = 30000;
+
+// Bewegungsmelder-Szenario-Dauer
+unsigned long scenarioDuration = 35000; // 2 Minuten
+unsigned long puppetOnTime = 500;
+
+// Klopfer-Einstellungen
+unsigned long klopfOnTime = 100;
+unsigned long klopfOffTime = 150;
+int klopfMin = 3;
+int klopfMax = 7;
+
+// Cooldowns pro Pin (ms) individuell
+unsigned long puppetCooldowns[puppetCount] = {60000, 45000, 30000, 90000, 120000};
+unsigned long klopferCooldowns[klopferCount] = {15000, 3000, 3000};
+
+// Bewegungsmelder-Pin (externer Pull-Down verwenden)
+const int motionPin = 12;
+
+// Feuerflacker-Variablen
+unsigned long lastFlicker = 0;
+unsigned long flickerInterval = 50; // alle 50 ms neue Werte
+int minBrightness = 80;   // Mindesthelligkeit
+int maxBrightness = 255;  // Maximalhelligkeit
+
+// ==================== INTERN ====================
+
+unsigned long lastEventTime = 0;
+unsigned long startTime;
+unsigned long motionEndTime = 0;
+bool pinsDone[puppetCount + klopferCount] = {false};
+
+// Pin-Status-Strukturen
+struct PinStatus {
+  bool isOn = false;
+  unsigned long endTime = 0;
+  unsigned long cooldownEnd = 0;
+  int klopfRemaining = 0;
+  bool klopfState = false;
+};
+
+PinStatus puppetStatus[puppetCount];
+PinStatus klopferStatus[klopferCount];
+
+void setup() {
+  startTime = millis();
+
+  // Puppen-Pins
+  for(int i=0;i<puppetCount;i++){
+    pinMode(puppetPins[i], OUTPUT);
+    digitalWrite(puppetPins[i], HIGH);
+  }
+  // Klopfer-Pins
+  for(int i=0;i<klopferCount;i++){
+    pinMode(klopferPins[i], OUTPUT);
+    digitalWrite(klopferPins[i], HIGH);
+  }
+
+  // Feuerflacker-Pins
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  analogWrite(redPin, 0);
+  analogWrite(greenPin, 0);
+
+  pinMode(motionPin, INPUT); // externer Pull-Down
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  randomSeed(analogRead(A0));
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ------------------ Bewegungsmelder ------------------
+  if(digitalRead(motionPin) == HIGH){
+    motionEndTime = now + scenarioDuration; // verlängert bei erneutem Trigger
+    digitalWrite(LED_BUILTIN, HIGH);
+  } else {
+    if(now > motionEndTime){
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+  }
+
+  // ------------------ Szenario aktiv? ------------------
+  if(now <= motionEndTime){
+
+    // === Feuerflacker während Szenario ===
+    if (now - lastFlicker >= flickerInterval) {
+      lastFlicker = now;
+
+      int redValue = random(minBrightness, maxBrightness);
+      int greenValue = random(minBrightness/4, maxBrightness/2);
+
+      analogWrite(redPin, redValue);
+      analogWrite(greenPin, greenValue);
+    }
+
+    // ------------------ Event auslösen ------------------
+    if(now - lastEventTime >= eventInterval){
+      lastEventTime = now;
+
+      int chosenIndex = -1;
+      bool inStartPhase = (now - startTime < startPhaseDuration);
+
+      // --- Startphase: noch nicht alle Pins aktiviert ---
+      if(inStartPhase){
+        int remaining[puppetCount + klopferCount];
+        int remCount = 0;
+        for(int i=0;i<puppetCount + klopferCount;i++){
+          if(!pinsDone[i]){
+            remaining[remCount++] = i;
+          }
+        }
+        if(remCount > 0){
+          chosenIndex = remaining[random(0, remCount)];
+          pinsDone[chosenIndex] = true;
+        }
+      }
+
+      // --- Normale Phase ---
+      if(chosenIndex == -1){
+        chosenIndex = random(0, puppetCount + klopferCount);
+      }
+
+      // ------------------ Pin aktivieren ------------------
+      if(chosenIndex < puppetCount){
+        int idx = chosenIndex;
+        if(!puppetStatus[idx].isOn && now >= puppetStatus[idx].cooldownEnd){
+          puppetStatus[idx].isOn = true;
+          puppetStatus[idx].endTime = now + puppetOnTime;
+          puppetStatus[idx].cooldownEnd = now + puppetCooldowns[idx];
+          digitalWrite(puppetPins[idx], LOW); // an
+        }
+      } else {
+        int idx = chosenIndex - puppetCount;
+        if(!klopferStatus[idx].isOn && now >= klopferStatus[idx].cooldownEnd){
+          klopferStatus[idx].isOn = true;
+          klopferStatus[idx].klopfRemaining = random(klopfMin, klopfMax+1);
+          klopferStatus[idx].klopfState = false;
+          klopferStatus[idx].endTime = now;
+          klopferStatus[idx].cooldownEnd = now + klopferCooldowns[idx];
+        }
+      }
+    }
+
+    // ------------------ Puppen auswerten ------------------
+    for(int i=0;i<puppetCount;i++){
+      if(puppetStatus[i].isOn && now >= puppetStatus[i].endTime){
+        puppetStatus[i].isOn = false;
+        digitalWrite(puppetPins[i], HIGH);
+      }
+    }
+
+    // ------------------ Klopfer auswerten ------------------
+    for(int i=0;i<klopferCount;i++){
+      if(klopferStatus[i].isOn && now >= klopferStatus[i].endTime){
+        if(klopferStatus[i].klopfRemaining > 0){
+          if(klopferStatus[i].klopfState){
+            digitalWrite(klopferPins[i], HIGH);
+            klopferStatus[i].klopfState = false;
+            klopferStatus[i].klopfRemaining--;
+          } else {
+            digitalWrite(klopferPins[i], LOW);
+            klopferStatus[i].klopfState = true;
+          }
+          klopferStatus[i].endTime = now + (klopferStatus[i].klopfState ? klopfOnTime : klopfOffTime);
+        } else {
+          digitalWrite(klopferPins[i], HIGH);
+          klopferStatus[i].isOn = false;
+        }
+      }
+    }
+  } else {
+    // Wenn Szenario aus → Flackerlicht aus
+    analogWrite(redPin, 0);
+    analogWrite(greenPin, 0);
+  }
+}
