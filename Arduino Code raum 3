@@ -1,0 +1,202 @@
+// Arduino Nano / Uno - PIR -> gesteuerte Relais (Pins 2..5)
+// Verhalten:
+// - PIR (Pin 10) HIGH -> Event startet für EVENT_DURATION_MS
+// - Jeder Relay hat eine Anfangsverzögerung (RELAY_INITIAL_DELAY_MS[])
+// - Relay an Index 1 (Pin 3) bleibt HIGH, sobald seine Anfangsverzögerung abgelaufen ist,
+//   und bleibt so bis das Event endet.
+// - Die anderen Relais pulsen: ON für RELAY_PULSE_MS, dann wieder OFF; Interval einstellbar per RELAY_INTERVAL_MS[].
+// - Nach Event-Ende (EVENT_DURATION_MS) wird alles ausgeschaltet und es wartet auf neues PIR HIGH.
+
+const uint8_t RELAY_PINS[] = {2, 3, 4, 5}; // Reihenfolge wichtig: index 1 = Pin 3 (dauerhaft ON während Event)
+const uint8_t NUM_RELAYS = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
+
+const uint8_t PIR_PIN = 10;
+const uint8_t LED_BUILTIN_PIN = LED_BUILTIN; // Status-LED während Event
+
+// === EINSTELLUNGEN ===
+// Eventdauer (ms)
+unsigned long EVENT_DURATION_MS = 20000UL; // z.B. 20s
+
+// Wie lange ein Relay bei einem Pulse an bleibt (ms)
+const unsigned long RELAY_PULSE_MS = 500UL; // 500 ms ON
+
+// Anfangsverzögerung vor dem ersten Trigger für jedes Relay (ms)
+// Beispiel: Relay an Pin2 nach 5000ms, Pin3 nach 1000ms, Pin4 nach 2000ms, Pin5 nach 0ms
+unsigned long RELAY_INITIAL_DELAY_MS[NUM_RELAYS] = {5000UL, 1000UL, 2000UL, 0UL};
+
+// Intervall für wiederkehrende Pulse für jedes Relay (ms).
+// Für das "dauerhaft ON"-Relay (Index 1) wird der Intervall ignoriert.
+unsigned long RELAY_INTERVAL_MS[NUM_RELAYS] = {10000UL, 0UL, 5000UL, 7000UL};
+// ======================
+
+// Wenn dein Relais-Modul aktiv LOW ist, setze RELAY_ON = LOW und RELAY_OFF = HIGH
+const uint8_t RELAY_ON  = LOW;
+const uint8_t RELAY_OFF = HIGH;
+
+// Laufzeit- / Statusvariablen
+bool eventRunning = false;
+unsigned long eventStart = 0;
+
+// pro-Relay Zustände:
+unsigned long nextRelayTriggerTime[NUM_RELAYS]; // absolute millis() Zeit des nächsten Triggers (erste = start + initialDelay)
+bool relayIsOn[NUM_RELAYS];
+unsigned long relayOnSince[NUM_RELAYS];
+
+unsigned long lastPirStateChange = 0;
+int lastPirState = LOW;
+
+unsigned long nowMillis() { return millis(); }
+
+void setup() {
+  Serial.begin(115200);
+  // Pins initialisieren
+  for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
+    relayIsOn[i] = false;
+    relayOnSince[i] = 0;
+    nextRelayTriggerTime[i] = 0;
+  }
+
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_BUILTIN_PIN, OUTPUT);
+  digitalWrite(LED_BUILTIN_PIN, LOW);
+
+  Serial.println("Setup fertig");
+}
+
+void loop() {
+  unsigned long t = nowMillis();
+  int pir = digitalRead(PIR_PIN);
+
+  // Detect rising edge: nur starten wenn PIR HIGH und vorher LOW (verhindert mehrfach-start)
+  if (!eventRunning) {
+    if (pir == HIGH && lastPirState == LOW) {
+      // Start Event
+      startEvent(t);
+    }
+  }
+
+  // Falls Event läuft: steuere Relais basierend auf Zeit
+  if (eventRunning) {
+    unsigned long elapsed = t - eventStart;
+
+    // 1) Pro-Relay Logik
+    for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+      handleRelay(i, t);
+    }
+
+    // 2) Prüfen ob Event beendet ist (unabhängig davon ob PIR noch HIGH)
+    if (elapsed >= EVENT_DURATION_MS) {
+      stopEvent();
+    }
+  }
+
+  // PIR state merken (für edge detection)
+  lastPirState = pir;
+
+  // kleine Pause (nicht zu groß, damit millis-Logik fein bleibt)
+  delay(10);
+}
+
+void startEvent(unsigned long t) {
+  eventRunning = true;
+  eventStart = t;
+  digitalWrite(LED_BUILTIN_PIN, HIGH); // Status-LED an
+  Serial.print("Event gestartet um ");
+  Serial.println(t);
+
+  // Setze first trigger times basierend auf initial delays
+  for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+    nextRelayTriggerTime[i] = eventStart + RELAY_INITIAL_DELAY_MS[i];
+    relayIsOn[i] = false;
+    relayOnSince[i] = 0;
+    // Falls initial delay == 0 und Relay ist das "dauerhaft ON" (index 1), schalte es sofort ein:
+    if (RELAY_INITIAL_DELAY_MS[i] == 0) {
+      if (i == 1) {
+        digitalWrite(RELAY_PINS[i], RELAY_ON);
+        relayIsOn[i] = true;
+        relayOnSince[i] = t;
+        Serial.print("Relay ");
+        Serial.print(i);
+        Serial.println(" sofort ON (dauerhaft während Event)");
+      } else {
+        // Bei non-dauerhaften Relais: wir erlauben normalen Triggerer auf nextRelayTriggerTime
+      }
+    }
+    Serial.print("Relay ");
+    Serial.print(i);
+    Serial.print(" nextTrigger @ +");
+    Serial.print(RELAY_INITIAL_DELAY_MS[i]);
+    Serial.println(" ms");
+  }
+}
+
+// stoppt Event und setzt alles zurück
+void stopEvent() {
+  eventRunning = false;
+  Serial.print("Event gestoppt um ");
+  Serial.println(nowMillis());
+  // Alle Relais aus
+  for (uint8_t i = 0; i < NUM_RELAYS; ++i) {
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
+    relayIsOn[i] = false;
+    relayOnSince[i] = 0;
+    nextRelayTriggerTime[i] = 0;
+  }
+  digitalWrite(LED_BUILTIN_PIN, LOW);
+}
+
+// handle Relay index i zur Zeit t
+void handleRelay(uint8_t i, unsigned long t) {
+  // Wenn index == 1 => special: stays ON once initial delay passed, until event ends
+  if (i == 1) {
+    // wenn noch nicht ON und die Zeit ist gekommen -> dauerhaft ON
+    if (!relayIsOn[i]) {
+      if ( (long)(t - nextRelayTriggerTime[i]) >= 0 ) {
+        digitalWrite(RELAY_PINS[i], RELAY_ON);
+        relayIsOn[i] = true;
+        relayOnSince[i] = t;
+        Serial.print("Relay (dauerhaft) ");
+        Serial.print(RELAY_PINS[i]);
+        Serial.println(" ON");
+      }
+    }
+    // ansonsten nichts (wird beim stopEvent ausgeschaltet)
+    return;
+  }
+
+  // Für die pulsend arbeitenden Relais:
+  // Sicherstellen, nextTriggerTime gesetzt (falls fallback)
+  if (nextRelayTriggerTime[i] == 0) nextRelayTriggerTime[i] = eventStart + RELAY_INITIAL_DELAY_MS[i];
+
+  if (!relayIsOn[i]) {
+    // ist Zeit für nächsten Pulse?
+    if ((long)(t - nextRelayTriggerTime[i]) >= 0) {
+      // einschalten
+      digitalWrite(RELAY_PINS[i], RELAY_ON);
+      relayIsOn[i] = true;
+      relayOnSince[i] = t;
+      // nächste Aktivierung wird um das Intervall verschoben
+      unsigned long interval = RELAY_INTERVAL_MS[i];
+      if (interval == 0) {
+        // falls 0 gegeben, verwende Standard 5000ms als safeguard
+        interval = 5000UL;
+      }
+      nextRelayTriggerTime[i] = nextRelayTriggerTime[i] + interval;
+      Serial.print("Relay (pulse) ");
+      Serial.print(RELAY_PINS[i]);
+      Serial.println(" ON (pulse start)");
+    }
+  } else {
+    // ist Pulse-Zeit abgelaufen?
+    if (t - relayOnSince[i] >= RELAY_PULSE_MS) {
+      digitalWrite(RELAY_PINS[i], RELAY_OFF);
+      relayIsOn[i] = false;
+      relayOnSince[i] = 0;
+      Serial.print("Relay (pulse) ");
+      Serial.print(RELAY_PINS[i]);
+      Serial.println(" OFF (pulse end)");
+    }
+  }
+}
