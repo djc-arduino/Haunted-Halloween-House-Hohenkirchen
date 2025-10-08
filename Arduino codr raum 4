@@ -1,0 +1,255 @@
+// Arduino Nano/Uno - PIR (Pin 10) -> Pins 2..9
+// Pins 2,3,4 = Neon-Flicker (dauerhaft während Event, langsamer Zufallsflicker)
+// Pins 5..9  = pulsend (initial delay, dann wiederholt Pulse für PULSE_MS)
+// Built-in LED leuchtet während Event
+
+#include <Arduino.h>
+
+// === PIN-Definition ===
+const uint8_t OUT_PINS[] = {2,3,4,5,6,7,8,9}; // 8 Ausgänge
+const uint8_t NUM_OUTS = sizeof(OUT_PINS)/sizeof(OUT_PINS[0]);
+
+const uint8_t PIR_PIN = 10;
+const uint8_t LED_PIN = LED_BUILTIN;
+
+// === KONFIGURATION ===
+// Gesamtdauer des Events (ms)
+unsigned long EVENT_DURATION_MS = 60000UL; // z.B. 20 s
+
+// Pulsdauer für pulsend arbeitende Ausgänge (ms)
+const unsigned long PULSE_MS = 500UL; // 500 ms ON per Pulse
+
+// Intervall für die pulsenderen Ausgänge (ms) - Index 0..2 (Pins 2..4) ignoriert
+unsigned long INTERVAL_MS[NUM_OUTS] = {
+  0UL,    // Pin2 (Neon)
+  0UL,    // Pin3 (Neon)
+  0UL,    // Pin4 (Neon)
+  8000UL, // Pin5
+  10000UL, // Pin6
+  18000UL, // Pin7
+  4000UL, // Pin8
+  6000UL  // Pin9
+};
+
+// Anfangsverzögerungen vor erstem Trigger (ms)
+unsigned long INITIAL_DELAY_MS[NUM_OUTS] = {
+  0UL,    // Pin2 (Neon) - startet sofort
+  0UL,    // Pin3 (Neon)
+  0UL,    // Pin4 (Neon)
+  50000UL, // Pin5 -> erstes Pulse nach 2s
+  3000UL,    // Pin6
+  5000UL, // Pin7
+  50000UL, // Pin8
+  50000UL   // Pin9
+};
+
+// Neon-Flicker-Parameter (langsamere, kontinuierliche Flicker)
+const unsigned long NEON_FLICKER_ON_MIN_MS  = 200UL;
+const unsigned long NEON_FLICKER_ON_MAX_MS  = 800UL;
+const unsigned long NEON_FLICKER_OFF_MIN_MS = 200UL;
+const unsigned long NEON_FLICKER_OFF_MAX_MS = 1200UL;
+
+// Output active level (HIGH = ON, LOW = OFF). Passe an dein Relais/Transistor an.
+const uint8_t OUT_ON  = LOW;
+const uint8_t OUT_OFF = HIGH;
+
+// === Laufzeitvariablen ===
+bool eventRunning = false;
+unsigned long eventStart = 0;
+
+// Für alle Ausgänge
+unsigned long nextTriggerTime[NUM_OUTS]; // absolute millis() des nächsten Triggers (erste = start + initial)
+bool outIsOn[NUM_OUTS];
+unsigned long outOnSince[NUM_OUTS];
+
+// Neon-spezifisch (Index 0..2)
+unsigned long neonNextToggle[3]; // Zeitpunkt für nächsten Toggle
+bool neonState[3];              // aktuell ON/OFF (true=ON)
+bool neonActive[3];             // ob Neon bereits gestartet (nach initial delay)
+
+// PIR edge detection
+int lastPirState = LOW;
+
+// compile-time checks
+static_assert(NUM_OUTS == 8, "Dieser Sketch erwartet genau 8 Ausgänge (Pins 2..9).");
+static_assert(sizeof(INTERVAL_MS)/sizeof(INTERVAL_MS[0]) == NUM_OUTS, "INTERVAL_MS Länge muss NUM_OUTS entsprechen.");
+static_assert(sizeof(INITIAL_DELAY_MS)/sizeof(INITIAL_DELAY_MS[0]) == NUM_OUTS, "INITIAL_DELAY_MS Länge muss NUM_OUTS entsprechen.");
+
+unsigned long nowMs() { return millis(); }
+
+void setup() {
+  Serial.begin(115200);
+
+  // Outs initialisieren
+  for (uint8_t i=0; i<NUM_OUTS; ++i) {
+    pinMode(OUT_PINS[i], OUTPUT);
+    digitalWrite(OUT_PINS[i], OUT_OFF);
+    outIsOn[i] = false;
+    outOnSince[i] = 0;
+    nextTriggerTime[i] = 0;
+  }
+
+  // Neon init
+  for (uint8_t n=0; n<3; ++n) {
+    neonNextToggle[n] = 0;
+    neonState[n] = false;
+    neonActive[n] = false;
+  }
+
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  randomSeed(analogRead(A0));
+  Serial.println("Setup fertig");
+}
+
+void loop() {
+  unsigned long t = nowMs();
+  int pir = digitalRead(PIR_PIN);
+
+  // Rising edge detection: starte Event nur beim Übergang LOW -> HIGH
+  if (!eventRunning) {
+    if (pir == HIGH && lastPirState == LOW) {
+      startEvent(t);
+    }
+  }
+
+  if (eventRunning) {
+    unsigned long elapsed = t - eventStart;
+
+    // Steuerung für alle Ausgänge
+    for (uint8_t i=0; i<NUM_OUTS; ++i) {
+      if (i <= 2) {
+        handleNeon(i, t);
+      } else {
+        handlePulse(i, t);
+      }
+    }
+
+    // Event Ende prüfen
+    if (elapsed >= EVENT_DURATION_MS) {
+      stopEvent();
+    }
+  }
+
+  lastPirState = pir;
+  delay(8); // kurze Pause
+}
+
+// Startet das Event: setzt Zeiten
+void startEvent(unsigned long t) {
+  eventRunning = true;
+  eventStart = t;
+  Serial.print("Event gestartet @ ");
+  Serial.println(t);
+  digitalWrite(LED_PIN, HIGH);
+
+  // Setze next trigger times für alle
+  for (uint8_t i=0; i<NUM_OUTS; ++i) {
+    nextTriggerTime[i] = eventStart + INITIAL_DELAY_MS[i];
+    outIsOn[i] = false;
+    outOnSince[i] = 0;
+  }
+
+  // Neon: initialisieren - aktiv sobald initial delay vorbei
+  for (uint8_t n=0; n<3; ++n) {
+    neonActive[n] = false;
+    neonState[n] = false;
+    neonNextToggle[n] = 0;
+    // Pin initial OFF
+    digitalWrite(OUT_PINS[n], OUT_OFF);
+  }
+}
+
+// Stoppt das Event: alle Ausgänge aus
+void stopEvent() {
+  eventRunning = false;
+  Serial.print("Event gestoppt @ ");
+  Serial.println(nowMs());
+
+  for (uint8_t i=0; i<NUM_OUTS; ++i) {
+    digitalWrite(OUT_PINS[i], OUT_OFF);
+    outIsOn[i] = false;
+    outOnSince[i] = 0;
+    nextTriggerTime[i] = 0;
+  }
+  for (uint8_t n=0; n<3; ++n) {
+    neonActive[n] = false;
+    neonState[n] = false;
+    neonNextToggle[n] = 0;
+  }
+
+  digitalWrite(LED_PIN, LOW);
+}
+
+// Neon-Flicker (kontinuierlich während Event)
+// i ist Index 0..2 (Pin 2..4)
+void handleNeon(uint8_t i, unsigned long t) {
+  uint8_t pin = OUT_PINS[i];
+  unsigned long startTime = eventStart + INITIAL_DELAY_MS[i];
+
+  // Warte auf initial delay
+  if ((long)(t - startTime) < 0) return;
+
+  // Aktivieren, falls noch nicht
+  if (!neonActive[i]) {
+    neonActive[i] = true;
+    neonState[i] = false; // beginne OFF -> toggle wird ON
+    neonNextToggle[i] = t; // sofort toggle
+  }
+
+  // Toggle wenn fällig
+  if ((long)(t - neonNextToggle[i]) >= 0) {
+    // Schalte um
+    neonState[i] = !neonState[i];
+    if (neonState[i]) {
+      // ON - wähle zufällige ON-Dauer
+      digitalWrite(pin, OUT_ON);
+      outIsOn[i] = true;
+      outOnSince[i] = t;
+      unsigned long dur = NEON_FLICKER_ON_MIN_MS + (random() % (NEON_FLICKER_ON_MAX_MS - NEON_FLICKER_ON_MIN_MS + 1));
+      neonNextToggle[i] = t + dur;
+    } else {
+      // OFF - wähle zufällige OFF-Dauer
+      digitalWrite(pin, OUT_OFF);
+      outIsOn[i] = false;
+      outOnSince[i] = 0;
+      unsigned long dur = NEON_FLICKER_OFF_MIN_MS + (random() % (NEON_FLICKER_OFF_MAX_MS - NEON_FLICKER_OFF_MIN_MS + 1));
+      neonNextToggle[i] = t + dur;
+    }
+  }
+}
+
+// Puls-Logik für index i >= 3 (Pins 5..9)
+void handlePulse(uint8_t i, unsigned long t) {
+  uint8_t pin = OUT_PINS[i];
+
+  // Falls nextTriggerTime nicht gesetzt (als Fallback), setze auf eventStart + initial
+  if (nextTriggerTime[i] == 0) nextTriggerTime[i] = eventStart + INITIAL_DELAY_MS[i];
+
+  if (!outIsOn[i]) {
+    // ist es Zeit für nächsten Pulse?
+    if ((long)(t - nextTriggerTime[i]) >= 0) {
+      // Trigger ON
+      digitalWrite(pin, OUT_ON);
+      outIsOn[i] = true;
+      outOnSince[i] = t;
+      // schedule next trigger
+      unsigned long interval = INTERVAL_MS[i];
+      if (interval == 0) interval = 5000UL; // Safeguard
+      nextTriggerTime[i] = nextTriggerTime[i] + interval;
+      Serial.print("Pulse ON pin ");
+      Serial.println(pin);
+    }
+  } else {
+    // Prüfen ob pulse Zeit abgelaufen
+    if ((unsigned long)(t - outOnSince[i]) >= PULSE_MS) {
+      digitalWrite(pin, OUT_OFF);
+      outIsOn[i] = false;
+      outOnSince[i] = 0;
+      Serial.print("Pulse OFF pin ");
+      Serial.println(pin);
+    }
+  }
+}
