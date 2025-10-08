@@ -16,7 +16,7 @@ const uint8_t LED_PIN = 12; // WS2812B data pin
 const uint16_t NUM_LEDS = 50;
 
 // Programmdauer einstellbar (ms)
-unsigned long PROGRAM_DURATION_MS = 20000UL; // z.B. 20 Sekunden, anpassbar
+unsigned long PROGRAM_DURATION_MS = 60000UL; // z.B. 20 Sekunden, anpassbar
 
 // Wie lange jede Augen-Variante gezeigt wird (ms) bevor zufällig gewechselt
 unsigned long VARIANT_DURATION_MS = 4000UL; // z.B. 4 Sekunden
@@ -25,10 +25,10 @@ unsigned long VARIANT_DURATION_MS = 4000UL; // z.B. 4 Sekunden
 const unsigned long RELAY_PULSE_MS = 500UL; // 500 ms ON per pulse
 
 // Für jedes Relay definierbares Intervall (wie oft das Relay für RELAY_PULSE_MS anklingt)
-unsigned long RELAY_INTERVALS[] = {3000UL, 5000UL, 4000UL, 5000UL};
+unsigned long RELAY_INTERVALS[] = {30000UL, 40000UL, 25000UL, 40000UL};
 
 // Anfangsverzögerung für jedes Relay (ms) -- Beispielwerte: Relay1 nach 5s, Relay2 sofort, Relay3 nach 2s, Relay4 nach 10s
-unsigned long RELAY_INITIAL_DELAYS[] = {5000UL, 0UL, 2000UL, 10000UL};
+unsigned long RELAY_INITIAL_DELAYS[] = {7000UL, 20000UL, 3000UL, 16000UL};
 
 // Compile-time checks: Arrays müssen zur Anzahl der Relais passen
 static_assert(sizeof(RELAY_INTERVALS) / sizeof(RELAY_INTERVALS[0]) == NUM_RELAYS,
